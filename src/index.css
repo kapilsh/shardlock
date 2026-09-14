@@ -1,0 +1,87 @@
+:root {
+  /* Palette — dark, GPU/terminal inspired (shared look with cuda-quiz) */
+  --bg: #0b0f0a;
+  --bg-elevated: #121712;
+  --bg-card: #161d15;
+  --bg-card-hover: #1b241a;
+  --border: #25301f;
+  --border-strong: #33421f;
+  --text: #e7f0e0;
+  --text-dim: #9fb295;
+  --text-faint: #6d7d63;
+  --nv-green: #76b900;
+  --nv-green-dim: #5c8f00;
+  --accent: #76b900;
+  --error: #f87171;
+  --error-bg: rgba(248, 113, 113, 0.1);
+  --warn: #fab219;
+  --warn-bg: rgba(250, 178, 25, 0.08);
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+
+  /* Series slots (dataviz reference palette, dark steps) — one per parallel axis */
+  --ax-ep: #d95926;
+  --ax-tp: #3987e5;
+  --ax-dp: #199e70;
+  --ax-cp: #9085e9;
+  --ax-hsdp: #c98500;
+
+  /* Memory stack segments */
+  --mem-params: #3987e5;
+  --mem-grads: #d95926;
+  --mem-optim: #199e70;
+  --mem-master: #c98500;
+  --mem-gather: #9085e9;
+
+  color-scheme: dark;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100vh;
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(118, 185, 0, 0.07), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(118, 185, 0, 0.04), transparent 55%),
+    var(--bg);
+  color: var(--text);
+  font-size: 14px;
+}
+
+code,
+.mono {
+  font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+a {
+  color: var(--nv-green);
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+input,
+select {
+  font-family: inherit;
+}
+
+::selection {
+  background: rgba(118, 185, 0, 0.3);
+}
