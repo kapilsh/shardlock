@@ -5,11 +5,12 @@
 // conjugate collectives, gradient shapes).
 //
 // Nodes sit on a 3-lane grid (col 0 / 1 / 2, fractional allowed); `row` is the
-// vertical order. Layout and drawing live in LayerView.jsx.
+// vertical order. Edges with route 'rail' run along a rail right of the grid
+// (long skips from the attention input). Layout and drawing live in LayerView.jsx.
 
 import { DTYPE_BYTES, prod } from './format.js'
-import { isMoeLayer } from './model.js'
-import { kvLocalHeads, moeTokens, moeTpRegion, seqDims } from './activations.js'
+import { compressRatio, hasIndexer, isHashLayer, isMoeLayer, layerMixer } from './model.js'
+import { cpExchange, kvLocalHeads, linearState, moeTokens, moeTpRegion, seqDims } from './activations.js'
 import { placeParam, unshardedLocalNumel } from './shard.js'
 
 const cdiv = (a, b) => Math.ceil(a / b)
@@ -27,6 +28,9 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
   const gB = DTYPE_BYTES[prec.grad]
   const L = `layers.${li}`
   const moe = isMoeLayer(cfg, li)
+  const mixer = layerMixer(cfg, li)
+  const dsv4 = cfg.attn_type === 'dsv4'
+  const hcM = cfg.hc_mult
   const byFqn = new Map(params.map((p) => [p.fqn, p]))
   const pick = (...fqns) => fqns.filter((f) => byFqn.has(f))
 
@@ -49,6 +53,8 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     d: dm(D, 'd'),
   }
   const hidden = (seq) => [sym.b, seq, sym.d]
+  // DeepSeek-V4 hyper-connections carry hc_mult copies of the residual stream
+  const stream = (seq) => (dsv4 ? [sym.b, seq, dm(hcM, 'm'), sym.d] : hidden(seq))
   const bytesOf = (shape) => prod(shape.map((x) => x.n)) * cB
   const perTp = (n, name) => dm(cdiv(n, tp), tpOn ? `${name}/tp` : name)
 
@@ -147,12 +153,40 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
   }
 
   // ---- Attention --------------------------------------------------------------
-  nextRow()
-  node({ id: 'res1', kind: 'fork' })
-  edge('in', 'res1', [lbl(hidden(sym.sSp), 'x')])
+  // Residual branch start: a fork, or hc_pre (hyper-connections), optionally
+  // followed by an attention-residual mix over earlier layers (Kimi K3).
+  const openSublayer = (id, hcKey, resKey, from, labels) => {
+    nextRow()
+    if (dsv4) {
+      node({ id, kind: 'module', title: `hc_pre · ${hcKey === 'hc_attn' ? 'attention' : 'ffn'}`, sub: `Sinkhorn mix: ${hcM} residual copies → 1`, params: pick(`${L}.${hcKey}.fn`, `${L}.${hcKey}.base`, `${L}.${hcKey}.scale`) })
+    } else {
+      node({ id, kind: 'fork' })
+    }
+    edge(from, id, labels)
+    if (!cfg.attn_res) return id
+    nextRow()
+    const resId = `${resKey}_res`
+    node({ id: resId, kind: 'module', title: 'attention residual', sub: 'softmax-weighted mix of earlier layer outputs', params: pick(`${L}.${resKey}_res_norm.weight`, `${L}.${resKey}_res_proj.weight`) })
+    edge(id, resId, dsv4 ? [lbl(hidden(sym.sSp))] : [])
+    return resId
+  }
+  const closeSublayer = (id, resId, from, labels) => {
+    nextRow()
+    if (dsv4) node({ id, kind: 'op', title: 'hc_post', sub: `post ⊗ out + comb · residual → ${hcM} copies` })
+    else node({ id, kind: 'add' })
+    edge(from, id, labels)
+    edges.push({ from: resId, to: id, kind: 'residual', labels: [] })
+  }
+  const cpNode = (id, col) => {
+    const x = cpExchange(cfg, par, train, li, cB)
+    const e = { axis: 'CP', group: `CP·${par.cp}`, groupKey: 'cp' }
+    node({ id, col, kind: 'comm', title: x.title, sub: x.sub, fwd: x.fwd.map((v) => ({ ...e, ...v })), bwd: x.bwd.map((v) => ({ ...e, ...v })) })
+  }
+
+  const attnFrom = openSublayer('res1', 'hc_attn', 'attn', 'in', [lbl(stream(sym.sSp), 'x')])
   nextRow()
   node({ id: 'attn_norm', kind: 'module', title: 'attn_norm', sub: 'RMSNorm', params: pick(`${L}.attn_norm.weight`) })
-  edge('res1', 'attn_norm')
+  edge(attnFrom, 'attn_norm', dsv4 && !cfg.attn_res ? [lbl(hidden(sym.sSp))] : [])
   let attnIn = 'attn_norm'
   if (tpOn) {
     nextRow()
@@ -163,10 +197,147 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
   const inLbl = [lbl(hidden(sym.sCp))]
   const H = perTp(cfg.n_heads, 'h')
   const A = `${L}.attn`
+  const colSub = tpOn ? 'column-parallel' : 'linear'
+
+  // ---- Linear attention: Kimi Delta Attention / gated DeltaNet --------------
+  const linearAttention = () => {
+    const kda = mixer === 'kda'
+    const st = linearState(cfg, par)
+    const hv = dm(st.Hv, tpOn ? (kda ? 'h/tp' : 'hv/tp') : kda ? 'h' : 'hv')
+    const hk = kda ? hv : dm(st.Hk, tpOn ? 'hk/tp' : 'hk')
+    const dk = dm(st.dk, 'dk')
+    const dv = dm(st.dv, 'dv')
+    const vFlat = dm(st.Hv * st.dv, `${hv.sym}·dv`)
+    nextRow()
+    if (kda) {
+      node({ id: 'la_qkv', col: 0, kind: 'module', title: 'q · k · v', sub: `${colSub} · short conv + SiLU`, params: pick(`${A}.q_proj.weight`, `${A}.k_proj.weight`, `${A}.v_proj.weight`, `${A}.q_conv1d.weight`, `${A}.k_conv1d.weight`, `${A}.v_conv1d.weight`) })
+      node({ id: 'la_gates', col: 2, kind: 'module', title: 'decay · write · output gates', sub: 'α low-rank · β = σ(b) · g full-rank', params: pick(`${A}.f_a_proj.weight`, `${A}.f_b_proj.weight`, `${A}.A_log`, `${A}.dt_bias`, `${A}.b_proj.weight`, `${A}.g_proj.weight`) })
+    } else {
+      node({ id: 'la_qkv', col: 0, kind: 'module', title: 'in_proj_qkv', sub: `${colSub} · short conv + SiLU`, params: pick(`${A}.in_proj_qkv.weight`, `${A}.conv1d.weight`) })
+      node({ id: 'la_gates', col: 2, kind: 'module', title: 'decay · write · output gates', sub: 'α from a · β = σ(b) · z gate', params: pick(`${A}.in_proj_a.weight`, `${A}.in_proj_b.weight`, `${A}.A_log`, `${A}.dt_bias`, `${A}.in_proj_z.weight`) })
+    }
+    edge(attnIn, 'la_qkv', inLbl)
+    edge(attnIn, 'la_gates')
+    if (par.cp > 1) {
+      nextRow()
+      cpNode('cp', 1)
+    }
+    nextRow()
+    node({ id: 'la_rule', kind: 'op', title: kda ? 'Kimi delta rule' : 'gated delta rule', sub: 'chunked · S ← α S + β (v − S k) kᵀ' })
+    edge('la_qkv', 'la_rule', [lbl([sym.b, sym.sCp, hk, dk], 'q,k'), lbl([sym.b, sym.sCp, hv, dv], 'v')])
+    edge('la_gates', 'la_rule', [lbl([sym.b, sym.sCp, kda ? dm(st.Hv * st.dk, `${hv.sym}·dk`) : hv], 'α'), lbl([sym.b, sym.sCp, hv], 'β')])
+    if (par.cp > 1) edge('cp', 'la_rule', [lbl([sym.b, hv, dk, dv], 'S')])
+    nextRow()
+    node({ id: 'la_norm', kind: 'module', title: 'gated RMSNorm', sub: kda ? 'norm(o) ⊙ σ(g)' : 'norm(o) ⊙ SiLU(z)', params: pick(kda ? `${A}.o_norm.weight` : `${A}.norm.weight`) })
+    edge('la_rule', 'la_norm', [lbl([sym.b, sym.sCp, hv, dv], 'o')])
+    edge('la_gates', 'la_norm', [lbl([sym.b, sym.sCp, vFlat], kda ? 'g' : 'z')])
+    nextRow()
+    node({ id: 'wo', kind: 'module', title: kda ? 'o_proj' : 'out_proj', sub: tpOn ? 'row-parallel' : 'output proj', params: pick(kda ? `${A}.o_proj.weight` : `${A}.out_proj.weight`) })
+    edge('la_norm', 'wo', [lbl([sym.b, sym.sCp, vFlat])])
+    return 'wo'
+  }
+
+  // ---- DeepSeek-V4: low-rank q, MQA window KV, compressor, indexer ----------
+  const v4Attention = () => {
+    const r = compressRatio(cfg, li)
+    const indexer = r === 4 && cfg.index_n_heads > 0
+    const hd = dm(cfg.head_dim, 'hd')
+    const qr = dm(cfg.q_lora_rank, 'q_rank')
+    const W = cfg.window_size
+    const Sq = sym.sCp
+    const qFlat = dm(H.n * cfg.head_dim, `${H.sym}·hd`)
+    nextRow() // A
+    node({ id: 'wq_a', col: 0, kind: 'module', title: 'wq_a', sub: 'low-rank down · replicated', params: pick(`${A}.wq_a.weight`) })
+    node({ id: 'wkv', col: 1, kind: 'module', title: 'wkv', sub: 'one KV head (MQA) · replicated', params: pick(`${A}.wkv.weight`) })
+    edge(attnIn, 'wq_a')
+    edge(attnIn, 'wkv', inLbl)
+    nextRow() // B
+    node({ id: 'q_norm', col: 0, kind: 'module', title: 'q_norm', sub: 'RMSNorm', params: pick(`${A}.q_norm.weight`) })
+    node({ id: 'kv_norm', col: 1, kind: 'module', title: 'kv_norm', sub: 'RMSNorm + RoPE', params: pick(`${A}.kv_norm.weight`) })
+    edge('wq_a', 'q_norm', [lbl([sym.b, Sq, qr])])
+    edge('wkv', 'kv_norm', [lbl([sym.b, Sq, hd])])
+    nextRow() // C
+    node({ id: 'wq_b', col: 0, kind: 'module', title: 'wq_b', sub: tpOn ? 'column-parallel' : 'up proj', params: pick(`${A}.wq_b.weight`) })
+    edge('q_norm', 'wq_b', [lbl([sym.b, Sq, qr])])
+    let kvSrc = 'kv_norm'
+    let kvLen = Sq
+    if (r) {
+      node({ id: 'compressor', col: 1, kind: 'module', title: `KV compressor ×${r}`, sub: `${r === 4 ? 'overlapping ' : ''}gated pooling · after window KV`, params: pick(`${A}.compressor.ape`, `${A}.compressor.wkv.weight`, `${A}.compressor.wgate.weight`, `${A}.compressor.norm.weight`) })
+      edge('kv_norm', 'compressor', [lbl([sym.b, Sq, hd], 'window kv')])
+      edge(attnIn, 'compressor', [], { route: 'rail' })
+      kvSrc = 'compressor'
+      kvLen = dm(sCp + cdiv(sCp, r), `${Sq.sym}+${Sq.sym}/${r}`)
+    }
+    nextRow() // D
+    node({ id: 'q_head', col: 0, kind: 'op', title: 'head RMSNorm + RoPE', sub: 'per-head norm on q' })
+    edge('wq_b', 'q_head', [lbl([sym.b, Sq, qFlat])])
+    const topk = Math.min(cfg.index_topk, cdiv(S, 4))
+    if (indexer) {
+      node({
+        id: 'indexer',
+        col: 2,
+        kind: 'module',
+        title: 'lightning indexer',
+        sub: `${cfg.index_n_heads} heads${tpOn ? ' · TP-sharded' : ''} · own ×4 compressor`,
+        params: pick(`${A}.indexer.wq_b.weight`, `${A}.indexer.weights_proj.weight`, `${A}.indexer.compressor.ape`, `${A}.indexer.compressor.wkv.weight`, `${A}.indexer.compressor.wgate.weight`, `${A}.indexer.compressor.norm.weight`),
+      })
+      edge('q_norm', 'indexer', [lbl([sym.b, Sq, qr], 'qr')], { route: 'early', labelAt: 'mid' })
+      edge(attnIn, 'indexer', [], { route: 'rail' })
+    }
+    let kvIn = kvSrc
+    let idxSrc = indexer ? 'indexer' : null
+    if (par.cp > 1 || (indexer && tpOn)) {
+      nextRow() // E
+      if (par.cp > 1) {
+        cpNode('cp', 1)
+        // the TP score all-reduce shares this gap; cp → attention still shows the kv shape
+        edge(kvSrc, 'cp', indexer && tpOn ? [] : [lbl([sym.b, kvLen, hd], 'kv')])
+        kvIn = 'cp'
+      }
+      if (indexer && tpOn) {
+        const bytes = b * sCp * cdiv(S, 4) * 4
+        node({
+          id: 'idx_ar',
+          col: 2,
+          kind: 'comm',
+          title: 'index scores',
+          sub: 'indexer heads are TP-sharded',
+          fwd: [tpEntry('all-reduce', bytes, 'sum the index scores [b, s, s/4] (fp32) from each TP rank’s share of indexer heads before picking top-k')],
+          bwd: [tpEntry('identity', bytes, 'the backward of a sum passes the gradient through unchanged', true)],
+        })
+        edge('indexer', 'idx_ar', [lbl([sym.b, Sq, dm(cdiv(S, 4), 's/4')], 'scores')])
+        idxSrc = 'idx_ar'
+      }
+    }
+    nextRow() // F
+    node({
+      id: 'sdpa',
+      kind: 'op',
+      title: 'sparse attention',
+      sub: indexer ? `window ${W} + top-${topk} compressed blocks` : r ? `window ${W} + all ×${r} compressed blocks` : `sliding window ${W}`,
+      params: pick(`${A}.attn_sink`),
+    })
+    edge('q_head', 'sdpa', [lbl([sym.b, Sq, H, hd], 'q')])
+    const kvOut = par.cp > 1 && r ? dm(sCp + cdiv(S, r), `${Sq.sym}+s/${r}`) : kvLen
+    edge(kvIn, 'sdpa', [lbl([sym.b, kvOut, hd], 'kv')])
+    // with both CP and the TP score all-reduce the label would collide with kv's; the node subtitle carries top-k
+    if (idxSrc) edge(idxSrc, 'sdpa', par.cp > 1 && idxSrc === 'idx_ar' ? [] : [lbl([sym.b, Sq, dm(topk, 'topk')], 'top-k idx')])
+    nextRow() // G
+    node({ id: 'wo_a', kind: 'module', title: 'wo_a', sub: `grouped low-rank · ${cfg.o_groups} groups${tpOn ? ' · col-parallel' : ''}`, params: pick(`${A}.wo_a.weight`) })
+    edge('sdpa', 'wo_a', [lbl([sym.b, Sq, qFlat])])
+    nextRow() // H
+    node({ id: 'wo', kind: 'module', title: 'wo_b', sub: tpOn ? 'row-parallel' : 'output proj', params: pick(`${A}.wo_b.weight`) })
+    edge('wo_a', 'wo', [lbl([sym.b, Sq, dm(cdiv(cfg.o_groups, tp) * cfg.o_lora_rank, tpOn ? 'g/tp·o_rank' : 'g·o_rank')])])
+    return 'wo'
+  }
+
+  // ---- Softmax attention: MHA / GQA / MLA -----------------------------------
+  const softmaxAttention = () => {
   let qOut
   let qLabels
   let kvSources
-  let kvElems
+  let indexerOut = false
+  const gate = cfg.attn_output_gate
 
   if (cfg.attn_type !== 'mla') {
     const hd = dm(cfg.head_dim, 'hd')
@@ -176,9 +347,8 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     const kvh = dm(kvLocalHeads(cfg, par), tpOn ? (kvRep ? '1' : `${KVsym}/tp`) : KVsym)
     const qShape = [sym.b, sym.sCp, H, hd]
     const kShape = [sym.b, sym.sCp, kvh, hd]
-    const colSub = tpOn ? 'column-parallel' : 'linear'
     nextRow()
-    node({ id: 'wq', col: 0, kind: 'module', title: 'wq', sub: colSub, params: pick(`${A}.wq.weight`, `${A}.wq.bias`) })
+    node({ id: 'wq', col: 0, kind: 'module', title: 'wq', sub: gate ? `${colSub} · q + output gate` : colSub, params: pick(`${A}.wq.weight`, `${A}.wq.bias`) })
     node({ id: 'wk', col: 1, kind: 'module', title: 'wk', sub: kvRep ? 'KV heads replicated over TP' : colSub, params: pick(`${A}.wk.weight`, `${A}.wk.bias`) })
     node({ id: 'wv', col: 2, kind: 'module', title: 'wv', sub: kvRep ? 'KV heads replicated over TP' : colSub, params: pick(`${A}.wv.weight`, `${A}.wv.bias`) })
     edge(attnIn, 'wq')
@@ -188,8 +358,9 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     let kPrev = 'wk'
     if (cfg.qk_norm) {
       nextRow()
-      node({ id: 'q_norm', col: 0, kind: 'module', title: 'q_norm', sub: 'RMSNorm per head', params: pick(`${A}.q_norm.weight`) })
-      node({ id: 'k_norm', col: 1, kind: 'module', title: 'k_norm', sub: 'RMSNorm per head', params: pick(`${A}.k_norm.weight`) })
+      const normSub = cfg.qk_norm_type === 'full' ? `RMSNorm over all heads${tpOn ? ' · sharded' : ''}` : 'RMSNorm per head'
+      node({ id: 'q_norm', col: 0, kind: 'module', title: 'q_norm', sub: normSub, params: pick(`${A}.q_norm.weight`) })
+      node({ id: 'k_norm', col: 1, kind: 'module', title: 'k_norm', sub: normSub, params: pick(`${A}.k_norm.weight`) })
       edge('wq', 'q_norm', [lbl(qShape, 'q')])
       edge('wk', 'k_norm', [lbl(kShape, 'k')])
       qPrev = 'q_norm'
@@ -206,7 +377,6 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
       ['rope_k', [lbl(kShape, 'k')]],
       ['wv', [lbl(kShape, 'v')]],
     ]
-    kvElems = 2 * prod(kShape.map((x) => x.n))
   } else {
     const qk = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
     const qkd = dm(qk, 'qk_hd')
@@ -215,6 +385,7 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     const kvr = dm(cfg.kv_lora_rank, 'kv_rank')
     const one = dm(1, '1')
     const lora = cfg.q_lora_rank > 0
+    const indexer = hasIndexer(cfg, li)
     const qr = dm(cfg.q_lora_rank, 'q_rank')
     const qFlat = [sym.b, sym.sCp, dm(H.n * qk, `${H.sym}·qk_hd`)]
 
@@ -232,49 +403,43 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     nextRow() // C
     if (lora) node({ id: 'q_b', col: 0, kind: 'module', title: 'q_b_proj', sub: tpOn ? 'column-parallel' : 'up proj', params: pick(`${A}.q_b_proj.weight`) })
     node({ id: 'kv_a_norm', col: 1, kind: 'module', title: 'kv_a_norm', sub: 'RMSNorm', params: pick(`${A}.kv_a_norm.weight`) })
-    node({ id: 'rope_k', col: 2, kind: 'op', title: 'RoPE', sub: 'shared k_rope (1 head)' })
+    // With an indexer, lane 2 carries the indexer and k_rope's RoPE folds into the concat node.
+    if (!indexer) node({ id: 'rope_k', col: 2, kind: 'op', title: 'RoPE', sub: 'shared k_rope (1 head)' })
     if (lora) edge('q_a_norm', 'q_b', [lbl([sym.b, sym.sCp, qr])])
+    if (indexer) {
+      node({
+        id: 'indexer',
+        col: 2,
+        kind: 'module',
+        title: 'lightning indexer',
+        sub: `DSA · ${cfg.index_n_heads} heads · replicated over TP`,
+        params: pick(`${A}.indexer.wq_b.weight`, `${A}.indexer.wk.weight`, `${A}.indexer.k_norm.weight`, `${A}.indexer.k_norm.bias`, `${A}.indexer.weights_proj.weight`),
+      })
+      edge(attnIn, 'indexer', [], { route: 'early' })
+      if (lora) edge('q_a_norm', 'indexer', [lbl([sym.b, sym.sCp, qr], 'c_q')], { route: 'early', labelAt: 'mid' })
+    }
     edge('kv_split', 'kv_a_norm', [lbl([sym.b, sym.sCp, kvr], 'c_kv')])
-    edge('kv_split', 'rope_k', [lbl([sym.b, sym.sCp, one, ropeD], 'k_rope')], { labelAt: 'mid' })
+    if (!indexer) edge('kv_split', 'rope_k', [lbl([sym.b, sym.sCp, one, ropeD], 'k_rope')], { labelAt: 'mid' })
     nextRow() // D
     node({ id: 'rope_q', col: 0, kind: 'op', title: 'split + RoPE', sub: 'q_nope | RoPE(q_rope)' })
     node({ id: 'kv_b', col: 1, kind: 'module', title: 'kv_b_proj', sub: tpOn ? 'column-parallel' : 'up proj', params: pick(`${A}.kv_b_proj.weight`) })
     edge(lora ? 'q_b' : 'q_a', 'rope_q', [lbl(qFlat)])
     edge('kv_a_norm', 'kv_b', [lbl([sym.b, sym.sCp, kvr])])
     nextRow() // E
-    node({ id: 'kv_join', col: 1, kind: 'op', title: 'split + concat', sub: 'k = [k_nope, k_rope], v' })
+    node({ id: 'kv_join', col: 1, kind: 'op', title: 'split + concat', sub: indexer ? 'k = [k_nope, RoPE(k_rope)], v' : 'k = [k_nope, k_rope], v' })
     edge('kv_b', 'kv_join', [lbl([sym.b, sym.sCp, dm(H.n * (cfg.qk_nope_head_dim + cfg.v_head_dim), `${H.sym}·(nope+v_hd)`)])])
-    edge('rope_k', 'kv_join')
+    if (!indexer) edge('rope_k', 'kv_join')
     qOut = 'rope_q'
     qLabels = [lbl([sym.b, sym.sCp, H, qkd], 'q')]
     kvSources = [['kv_join', [lbl([sym.b, sym.sCp, H, qkd], 'k'), lbl([sym.b, sym.sCp, H, vd], 'v')]]]
-    kvElems = b * H.n * sCp * (qk + cfg.v_head_dim)
+    if (indexer) indexerOut = true
   }
 
   let sdpaIn = kvSources
   const ring = par.cpStyle === 'ring'
   if (par.cp > 1) {
     nextRow()
-    const group = `CP·${par.cp}`
-    const kvBytes = kvElems * cB
-    const steps = par.cp - 1
-    const e = { axis: 'CP', group, groupKey: 'cp' }
-    node({
-      id: 'cp',
-      col: kvSources.length === 2 ? 1.5 : 1,
-      kind: 'comm',
-      title: ring ? 'ring attention' : 'all-gather KV attention',
-      sub: 'context parallel',
-      fwd: ring
-        ? [{ ...e, op: 'send/recv', count: steps, bytes: kvBytes, note: `pass this rank’s K,V chunk to the next CP rank and receive one from the previous; ${steps} step(s), attention is computed blockwise against each chunk as it arrives` }]
-        : [{ ...e, op: 'all-gather', bytes: kvBytes * par.cp, note: 'gather K,V for the full sequence; the local q chunk attends to every key (Llama 3 style)' }],
-      bwd: ring
-        ? [{ ...e, op: 'send/recv', count: steps, bytes: 2 * kvBytes, note: 'rotate K,V together with the accumulated dK,dV around the ring' }]
-        : [
-            { ...e, op: 'all-gather', bytes: kvBytes * par.cp, note: 're-gather K,V for backward' },
-            { ...e, op: 'reduce-scatter', bytes: kvBytes * par.cp, note: 'sum dK,dV and return them to the ranks owning each chunk' },
-          ],
-    })
+    cpNode('cp', kvSources.length === 2 ? 1.5 : 1)
     for (const [src, labels] of kvSources) edge(src, 'cp', labels)
     const outLabels = kvSources
       .flatMap(([, labels]) => labels)
@@ -287,31 +452,42 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     id: 'sdpa',
     kind: 'op',
     title: 'scaled dot-product attention',
-    sub: par.cp > 1 ? (ring ? 'causal · blockwise over the ring' : 'causal · local q vs all k,v') : 'causal · flash',
+    sub: indexerOut
+      ? `sparse · each query reads top-${Math.min(cfg.index_topk || S, S).toLocaleString('en-US')} keys`
+      : `${par.cp > 1 ? (ring ? 'causal · blockwise over the ring' : 'causal · local q vs all k,v') : 'causal · flash'}${gate ? ' · σ-gated output' : ''}`,
     params: pick(`${A}.sinks`),
   })
+  const mlaGate = gate && cfg.attn_type === 'mla'
+  if (mlaGate) {
+    node({ id: 'g_proj', col: 2, kind: 'module', title: 'g_proj', sub: `output gate${tpOn ? ' · column-parallel' : ''}`, params: pick(`${A}.g_proj.weight`) })
+    edge(attnIn, 'g_proj', [], { route: 'rail' })
+  }
   edge(qOut, 'sdpa', qLabels)
+  if (indexerOut) {
+    const topk = Math.min(cfg.index_topk || S, S)
+    edge('indexer', 'sdpa', [lbl([sym.b, sym.sCp, dm(topk, 'topk')], 'top-k idx')])
+  }
   for (const [src, labels] of sdpaIn) edge(src, 'sdpa', labels)
   const outDim = cfg.attn_type === 'mla' ? dm(H.n * cfg.v_head_dim, `${H.sym}·v_hd`) : dm(H.n * cfg.head_dim, `${H.sym}·hd`)
   nextRow()
   node({ id: 'wo', kind: 'module', title: 'wo', sub: tpOn ? 'row-parallel' : 'output proj', params: pick(`${A}.wo.weight`, `${A}.wo.bias`) })
   edge('sdpa', 'wo', [lbl([sym.b, sym.sCp, outDim])])
-  let attnOut = 'wo'
+  if (mlaGate) edge('g_proj', 'wo', [lbl([sym.b, sym.sCp, outDim], 'σ(g)')])
+  return 'wo'
+  }
+
+  const mixOut = mixer === 'kda' || mixer === 'gdn' ? linearAttention() : mixer === 'dsv4' ? v4Attention() : softmaxAttention()
+  let attnOut = mixOut
   if (tpOn) {
     nextRow()
     tpExit('tp_attn_out', 'attention')
-    edge('wo', 'tp_attn_out', [lbl(hidden(sym.sCp))])
+    edge(mixOut, 'tp_attn_out', [lbl(hidden(sym.sCp))])
     attnOut = 'tp_attn_out'
   }
-  nextRow()
-  node({ id: 'add1', kind: 'add' })
-  edge(attnOut, 'add1', [lbl(hidden(sym.sSp))])
-  edges.push({ from: 'res1', to: 'add1', kind: 'residual', labels: [] })
+  closeSublayer('add1', 'res1', attnOut, [lbl(hidden(sym.sSp))])
 
   // ---- FFN ----------------------------------------------------------------------
-  nextRow()
-  node({ id: 'res2', kind: 'fork' })
-  edge('add1', 'res2')
+  const ffnFrom = openSublayer('res2', 'hc_ffn', 'mlp', 'add1', dsv4 ? [lbl(stream(sym.sSp))] : [])
   let ffnOut
   let ffnOutShape
   let exitNeeded
@@ -320,7 +496,7 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     const F = `${L}.mlp`
     nextRow()
     node({ id: 'ffn_norm', kind: 'module', title: 'mlp_norm', sub: 'RMSNorm', params: pick(`${L}.mlp_norm.weight`) })
-    edge('res2', 'ffn_norm')
+    edge(ffnFrom, 'ffn_norm', dsv4 && !cfg.attn_res ? [lbl(hidden(sym.sSp))] : [])
     let mIn = 'ffn_norm'
     if (tpOn) {
       nextRow()
@@ -349,7 +525,7 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     const M = `${L}.moe`
     nextRow()
     node({ id: 'ffn_norm', kind: 'module', title: 'moe_norm', sub: 'RMSNorm', params: pick(`${L}.moe_norm.weight`) })
-    edge('res2', 'ffn_norm')
+    edge(ffnFrom, 'ffn_norm', dsv4 && !cfg.attn_res ? [lbl(hidden(sym.sSp))] : [])
     const region = moeTpRegion(cfg, par)
     let mIn = 'ffn_norm'
     if (region) {
@@ -358,30 +534,36 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
       edge('ffn_norm', 'tp_moe_in', [lbl(hidden(sym.sSp))])
       mIn = 'tp_moe_in'
     }
-    const { T, dispatched, perExpert, localExperts } = moeTokens(cfg, par, train)
+    const { T, dispatched, perExpert, localExperts, width } = moeTokens(cfg, par, train)
+    const latent = cfg.moe_latent_dim > 0
+    const hash = isHashLayer(cfg, li)
     const seqT = region ? sym.sCp : sym.sSp
     const Td = dm(T, `b·${seqT.sym}`)
     const E = dm(cfg.n_routed_experts, 'E')
     const K = dm(cfg.n_activated_experts, 'k')
     const tok = [Td, sym.d]
-    const disp = [dm(dispatched, `${Td.sym}·k`), sym.d]
+    const dx = latent ? dm(width, 'd_lat') : sym.d
+    const disp = [dm(dispatched, `${Td.sym}·k`), dx]
     const shared = cfg.n_shared_experts > 0
     const swiglu = (P) => pick(`${P}.w_gate.weight`, `${P}.w_gate.bias`, `${P}.w_up.weight`, `${P}.w_up.bias`, `${P}.w_down.weight`, `${P}.w_down.bias`)
 
     nextRow()
-    node({ id: 'router', col: 0, kind: 'module', title: 'router', sub: tpOn ? 'replicated over TP' : 'gate', params: pick(`${M}.router.weight`, `${M}.router.bias`, `${M}.router.balance_bias`) })
+    node({ id: 'router', col: 0, kind: 'module', title: 'router', sub: hash ? 'hash routing: token id → experts' : tpOn ? 'replicated over TP' : 'gate', params: pick(`${M}.router.weight`, `${M}.router.bias`, `${M}.router.balance_bias`, `${M}.router.tid2eid`) })
     if (shared) {
-      node({ id: 'shared', col: 2, kind: 'module', title: 'shared_experts', sub: `SwiGLU on every token${tpOn ? ' · TP-sharded' : ''}`, params: swiglu(`${M}.shared_experts`) })
+      node({ id: 'shared', col: 2, kind: 'module', title: 'shared_experts', sub: `${cfg.shared_expert_gate ? 'σ-gated ' : ''}SwiGLU on every token${tpOn ? ' · TP-sharded' : ''}`, params: [...swiglu(`${M}.shared_experts`), ...pick(`${M}.shared_gate.weight`)] })
     }
     edge(mIn, 'router', [lbl(tok, 'tokens')])
     if (shared) edge(mIn, 'shared')
     nextRow()
-    node({ id: 'topk', col: 0, kind: 'op', title: 'top-k', sub: `sigmoid scores → ${cfg.n_activated_experts} of ${cfg.n_routed_experts}` })
+    node({ id: 'topk', col: 0, kind: 'op', title: hash ? 'hash lookup' : 'top-k', sub: hash ? `expert ids = tid2eid[token] (${cfg.n_activated_experts})` : `scores → ${cfg.n_activated_experts} of ${cfg.n_routed_experts}` })
     edge('router', 'topk', [lbl([Td, E], 'scores')])
+    if (latent) {
+      node({ id: 'latent_down', col: 1, kind: 'module', title: 'latent_down', sub: `experts run at width ${width.toLocaleString('en-US')}`, params: pick(`${M}.latent_down.weight`) })
+    }
 
     nextRow()
     const epGroup = `EP·${par.ep}`
-    const epE = { axis: 'EP', group: epGroup, groupKey: 'ep', bytes: dispatched * D * cB }
+    const epE = { axis: 'EP', group: epGroup, groupKey: 'ep', bytes: dispatched * width * cB }
     if (par.ep > 1) {
       node({
         id: 'dispatch',
@@ -394,7 +576,12 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     } else {
       node({ id: 'dispatch', kind: 'op', title: 'permute', sub: 'group token copies by expert' })
     }
-    edge(mIn, 'dispatch')
+    if (latent) {
+      edge(mIn, 'latent_down')
+      edge('latent_down', 'dispatch', [lbl([Td, dx])])
+    } else {
+      edge(mIn, 'dispatch')
+    }
     edge('topk', 'dispatch', [lbl([Td, K], 'indices')])
 
     nextRow()
@@ -434,11 +621,24 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     edge('experts', 'combine', [lbl(disp)])
 
     nextRow()
-    node({ id: 'wsum', kind: 'op', title: shared ? 'Σ gate · expert + shared' : 'Σ gate · expert', sub: 'weighted combine' })
+    const sumHere = shared && !latent
+    node({ id: 'wsum', kind: 'op', title: sumHere ? 'Σ gate · expert + shared' : 'Σ gate · expert', sub: 'weighted combine' })
     edge('combine', 'wsum', [lbl(disp)])
     edge('topk', 'wsum', [lbl([Td, K], 'gates')])
-    if (shared) edge('shared', 'wsum', [lbl(tok)])
     ffnOut = 'wsum'
+    if (latent) {
+      nextRow()
+      node({ id: 'latent_up', kind: 'module', title: 'latent_norm + latent_up', sub: 'back to model width', params: pick(`${M}.latent_norm.weight`, `${M}.latent_up.weight`) })
+      edge('wsum', 'latent_up', [lbl([Td, dx])])
+      ffnOut = 'latent_up'
+      if (shared) {
+        nextRow()
+        node({ id: 'add_shared', kind: 'op', title: '+ shared experts', sub: 'routed + shared' })
+        edge('latent_up', 'add_shared', [lbl(tok)])
+        ffnOut = 'add_shared'
+      }
+    }
+    if (shared) edge('shared', ffnOut, [lbl(tok)])
     ffnOutShape = hidden(seqT)
     exitNeeded = region
   }
@@ -450,17 +650,14 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     ffnOut = 'tp_ffn_out'
     ffnOutShape = hidden(sym.sSp)
   }
-  nextRow()
-  node({ id: 'add2', kind: 'add' })
-  edge(ffnOut, 'add2', [lbl(ffnOutShape)])
-  edges.push({ from: 'res2', to: 'add2', kind: 'residual', labels: [] })
+  closeSublayer('add2', 'res2', ffnOut, [lbl(ffnOutShape)])
 
   nextRow()
   node({ id: 'out', kind: 'io', title: `${L} output`, sub: li + 1 < cfg.n_layers ? `to layers.${li + 1}` : 'to final_norm' })
   if (bottom.fwd.length || bottom.bwd.length) {
     node({ id: 'dp_bottom', kind: 'comm', col: 2, title: `${L} params · ${par.dpStrategy.toUpperCase()}`, sub: 'parameter collectives', ...bottom })
   }
-  edge('add2', 'out', [lbl(hidden(sym.sSp))])
+  edge('add2', 'out', [lbl(stream(sym.sSp))])
 
   const totals = { fwd: 0, bwd: 0, fwdCalls: 0, bwdCalls: 0 }
   for (const n of nodes) {

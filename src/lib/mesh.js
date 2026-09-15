@@ -140,6 +140,18 @@ export function validateParallel(par, cfg, train) {
         warnings.push(`n_kv_heads (${KV}) < tp (${par.tp}): KV heads are replicated across TP ranks`)
       }
     }
+    const divides = (name, n) => {
+      if (n % par.tp !== 0) errors.push(`${name} (${n}) must be divisible by tp (${par.tp})`)
+    }
+    if (cfg.attn_type === 'dsv4') {
+      divides('o_groups', cfg.o_groups)
+      if (cfg.index_n_heads > 0) divides('indexer heads', cfg.index_n_heads)
+    }
+    if (cfg.linear_attn === 'kda') divides('KDA heads', cfg.la_num_heads)
+    if (cfg.linear_attn === 'gdn') {
+      divides('DeltaNet key heads', cfg.la_num_k_heads)
+      divides('DeltaNet value heads', cfg.la_num_heads)
+    }
     const uneven = (name, n) => {
       if (n % par.tp !== 0) warnings.push(`${name} (${n}) not divisible by tp: uneven (padded) shards`)
     }

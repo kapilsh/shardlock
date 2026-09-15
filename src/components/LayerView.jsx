@@ -15,6 +15,7 @@ const RAIL = 64
 const GAP = 46
 const PAD = 16
 const LH = 13
+const RAIL_R = 28 // right-hand rail for long skip edges
 
 function nodeHeight(n) {
   switch (n.kind) {
@@ -50,17 +51,20 @@ function layout(graph) {
     }
     y += hMax + GAP
   }
-  return { pos, width: RAIL + 3 * LANE + PAD, height: y - GAP + PAD }
+  const lanes = Math.max(3, Math.ceil(Math.max(...graph.nodes.map((n) => n.col)) + 1))
+  const rail = graph.edges.some((e) => e.route === 'rail')
+  const railX = RAIL + lanes * LANE + RAIL_R / 2
+  return { pos, width: RAIL + lanes * LANE + (rail ? RAIL_R : PAD), height: y - GAP + PAD, railX }
 }
 
 const labelText = (l, mode) => `${l.name ? `${l.name} ` : ''}${fmtShape(l.shape, mode)}`
 const labelWidth = (labels, mode) => Math.max(0, ...labels.map((l) => labelText(l, mode).length + 1)) * 6.4
 
-function edgeGeometry(graph, pos, width, mode) {
+function edgeGeometry(graph, pos, width, mode, railX) {
   const inCount = new Map()
   const outCount = new Map()
   for (const e of graph.edges) {
-    if (e.kind === 'residual') continue
+    if (e.kind === 'residual' || e.route === 'rail') continue
     inCount.set(e.to, (inCount.get(e.to) ?? 0) + 1)
     outCount.set(e.from, (outCount.get(e.from) ?? 0) + 1)
   }
@@ -80,6 +84,18 @@ function edgeGeometry(graph, pos, width, mode) {
         label: { x: rx - 6, y: (y0 + y1) / 2 },
       }
     }
+    if (e.route === 'rail') {
+      const x0 = s.x + s.w
+      const y0 = s.y + s.h / 2
+      const x1 = t.x + t.w
+      const y1 = t.y + t.h / 2
+      const r = 10
+      return {
+        ...e,
+        d: `M ${x0} ${y0} L ${railX - r} ${y0} Q ${railX} ${y0} ${railX} ${y0 + r} L ${railX} ${y1 - r} Q ${railX} ${y1} ${railX - r} ${y1} L ${x1} ${y1}`,
+        label: { x: railX, y: y0, anchor: 'middle' },
+      }
+    }
     const sx = s.cx
     const sy = s.y + s.h
     const tx = t.cx
@@ -89,6 +105,13 @@ function edgeGeometry(graph, pos, width, mode) {
     if (Math.abs(sx - tx) < 1) {
       d = `M ${sx} ${sy} L ${tx} ${ty}`
       mid = { x: sx, y: (sy + ty) / 2 }
+    } else if (e.route === 'early') {
+      // Bend in the gap right below the source row, then run down the target lane.
+      const y0 = Math.max(sy, s.rowBottom)
+      const y1 = Math.min(y0 + GAP - 6, ty)
+      const ym = (y0 + y1) / 2
+      d = `M ${sx} ${sy} L ${sx} ${y0} C ${sx} ${ym} ${tx} ${ym} ${tx} ${y1} L ${tx} ${ty}`
+      mid = { x: (sx + tx) / 2, y: ym }
     } else {
       // Bend only inside the gap above the target's row, then drop straight in.
       const yr = Math.min(t.rowTop, ty)
@@ -107,7 +130,7 @@ function edgeGeometry(graph, pos, width, mode) {
       if (left && x - 8 - w < RAIL / 2 + 10) left = false
       return left ? { x: x - 8, anchor: 'end' } : { x: x + 8, anchor: 'start' }
     }
-    const siblings = graph.edges.filter((o) => o !== e && o.kind !== 'residual')
+    const siblings = graph.edges.filter((o) => o !== e && o.kind !== 'residual' && o.route !== 'rail')
     let label
     if (where === 'dst') {
       const fromRight = sx > tx + 1 || siblings.some((o) => o.to === e.to && pos.get(o.from).cx > tx + 1)
@@ -151,7 +174,7 @@ export default function LayerView({ params, coords }) {
   const graph = useMemo(() => buildLayerFlow(model, par, train, prec, params, li, coords), [model, par, train, prec, params, li, coords])
   const geo = useMemo(() => {
     const lay = layout(graph)
-    return { ...lay, edges: edgeGeometry(graph, lay.pos, lay.width, labelMode) }
+    return { ...lay, edges: edgeGeometry(graph, lay.pos, lay.width, labelMode, lay.railX) }
   }, [graph, labelMode])
   const byFqn = useMemo(() => new Map(params.map((p) => [p.fqn, p])), [params])
   const selected = graph.nodes.find((n) => n.id === selId) ?? null

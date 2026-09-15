@@ -1141,3 +1141,32 @@
   color: var(--text-dim);
   line-height: 1.45;
 }
+
+/* ---- Preset info ---------------------------------------------------------- */
+.preset-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  font-size: 0.76rem;
+}
+.preset-info a {
+  color: var(--nv-green);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.preset-info a:hover {
+  text-decoration: underline;
+}
+.preset-stats {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.2rem 0.6rem;
+  color: var(--text);
+}

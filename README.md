@@ -38,8 +38,39 @@ final_norm.weight
 lm_head.weight                                     # omitted when tied
 ```
 
-Presets: tiny dense / tiny MoE playground models (the MoE one matches `MoEDecoder`'s 4,396,288 params),
-and 2-layer truncations of Llama-3 8B, Qwen3 30B-A3B, GPT-OSS 20B and DeepSeek-V3 shapes.
+### Presets
+
+Every preset is taken from the model's `config.json`, safetensors headers and (where the architecture is new)
+its reference modeling code on Hugging Face, and shown truncated to 2–3 layers so each distinct layer type
+appears once. `npm run validate` rebuilds each preset at its real depth and checks the parameter total against
+the published safetensors count.
+
+| Group | Presets |
+| --- | --- |
+| Playground | Tiny dense, Tiny MoE (matches `MoEDecoder`, 4,396,288 params) |
+| DeepSeek | DeepSeek-V4-Flash, DeepSeek-V4-Pro, DeepSeek-V3 / V3.1, DeepSeek-V3.2 (MLA + DSA indexer) |
+| Moonshot | Kimi K3 (KDA / gated-MLA hybrid, latent MoE, attention residuals), Kimi K2 / K2.6 |
+| Qwen | Qwen3.8 2.4T-A95B and Qwen3-Next 80B-A3B (gated DeltaNet hybrid), Qwen3 32B / 30B-A3B / 235B-A22B, Qwen3-Coder 480B |
+| Z.ai | GLM-5.3 (MLA + DSA indexer), GLM-4.7-Flash, GLM-4.5, GLM-4.5-Air |
+| MiniMax | MiniMax-M2 / M2.7 (q/k norm over all heads) |
+| OpenAI | gpt-oss-20b, gpt-oss-120b |
+| Meta | Llama 3.1 8B, Llama 3.3 70B, Llama 4 Scout, Llama 4 Maverick (interleaved MoE) |
+| Mistral | Mixtral 8x22B |
+
+Totals match exactly for the new architectures and to within 0.01% elsewhere (DeepSeek-V3's published count
+includes FP8 scale tensors). Llama 4 is ~0.87B lower because its checkpoint also contains the vision encoder; Kimi K3
+is compared against its text weights. MTP modules are counted.
+
+**Block types**
+
+- **DeepSeek-V4** — low-rank q, single-head window KV, grouped low-rank output (`wo_a` / `wo_b`), per-layer KV
+  compressor (×4 with a lightning indexer, ×128 without), attention sinks, hyper-connections (4 residual copies with
+  Sinkhorn-mixed `hc_pre` / `hc_post`), hash-routed first layers.
+- **Kimi K3** — Kimi Delta Attention on 3 of every 4 layers, output-gated MLA on the rest, attention residuals over
+  earlier layers, routed experts at a 3584-d latent width.
+- **Qwen3.8 / Qwen3-Next** — gated DeltaNet on 3 of every 4 layers, output-gated GQA on the rest, σ-gated shared expert.
+
+**Not modeled yet**: Nemotron-3.5 (Mamba hybrid), Gemma 4.
 
 ## Parallelism conventions
 

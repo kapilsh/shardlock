@@ -3,10 +3,10 @@
 // for all-gather / all-reduce, the input for reduce-scatter).
 
 import { DTYPE_BYTES } from './format.js'
-import { isMoeLayer } from './model.js'
+import { compressRatio, isMoeLayer, layerMixer } from './model.js'
 import { rankCoords } from './mesh.js'
 import { placeParam, shardLevels, unshardedLocalNumel } from './shard.js'
-import { kvLocalHeads, moeTokens, moeTpRegion, seqDims } from './activations.js'
+import { cpExchange, moeTokens, moeTpRegion, seqDims } from './activations.js'
 
 const DDP_BUCKET = 25 * 2 ** 20
 
@@ -40,6 +40,14 @@ export function stepCollectives(cfg, par, train, prec, params) {
       if (sp) push({ axis: 'TP', phase: 'bwd', op: 'all-gather', group: grp, what: 'tok_embeddings grad', bytes: hidden })
     }
     region('attention', cfg.n_layers)
+    // DeepSeek-V4 lightning indexer: heads are TP-sharded and scores all-reduced
+    const idxLayers = Array.from({ length: cfg.n_layers }, (_, i) => i).filter(
+      (i) => layerMixer(cfg, i) === 'dsv4' && compressRatio(cfg, i) === 4 && cfg.index_n_heads > 0,
+    ).length
+    if (idxLayers) {
+      const bytes = b * sCp * Math.ceil(train.seq_len / 4) * 4
+      push({ axis: 'TP', phase: 'fwd', op: 'all-reduce', group: grp, what: 'lightning indexer scores (fp32)', bytes, count: idxLayers })
+    }
     const nDense = cfg.arch === 'moe' ? Math.min(cfg.n_dense_layers, cfg.n_layers) : cfg.n_layers
     if (nDense) region('dense mlp', nDense)
     const nMoe = cfg.n_layers - nDense
@@ -53,23 +61,19 @@ export function stepCollectives(cfg, par, train, prec, params) {
   // ---- Context parallel -----------------------------------------------------
   if (par.cp > 1) {
     const grp = `CP·${par.cp}`
-    let kvNumel
-    if (cfg.attn_type === 'mla') {
-      const H = cfg.n_heads / par.tp
-      kvNumel = b * H * sCp * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim)
-    } else {
-      kvNumel = b * kvLocalHeads(cfg, par) * sCp * cfg.head_dim * 2
+    const agg = new Map()
+    for (let i = 0; i < cfg.n_layers; i++) {
+      const x = cpExchange(cfg, par, train, i, cB)
+      for (const phase of ['fwd', 'bwd']) {
+        for (const e of x[phase]) {
+          const key = `${phase}|${e.op}|${e.what}|${e.bytes}`
+          const r = agg.get(key) ?? { axis: 'CP', phase, op: e.op, group: grp, what: e.what, bytes: e.bytes, count: 0 }
+          r.count += e.count ?? 1
+          agg.set(key, r)
+        }
+      }
     }
-    const kv = kvNumel * cB
-    const L = cfg.n_layers
-    if (par.cpStyle === 'ring') {
-      push({ axis: 'CP', phase: 'fwd', op: 'send/recv', group: grp, what: 'ring attention: K,V chunk per step', bytes: kv, count: L * (par.cp - 1) })
-      push({ axis: 'CP', phase: 'bwd', op: 'send/recv', group: grp, what: 'ring attention: K,V + dK,dV per step', bytes: 2 * kv, count: L * (par.cp - 1) })
-    } else {
-      push({ axis: 'CP', phase: 'fwd', op: 'all-gather', group: grp, what: 'all-gather K,V (full sequence)', bytes: kv * par.cp, count: L })
-      push({ axis: 'CP', phase: 'bwd', op: 'all-gather', group: grp, what: 're-gather K,V', bytes: kv * par.cp, count: L })
-      push({ axis: 'CP', phase: 'bwd', op: 'reduce-scatter', group: grp, what: 'dK,dV back to owners', bytes: kv * par.cp, count: L })
-    }
+    for (const r of agg.values()) push(r)
   }
 
   // ---- Expert parallel ------------------------------------------------------
@@ -77,8 +81,8 @@ export function stepCollectives(cfg, par, train, prec, params) {
     const grp = `EP·${par.ep}`
     const nMoe = Array.from({ length: cfg.n_layers }, (_, i) => isMoeLayer(cfg, i)).filter(Boolean).length
     if (nMoe) {
-      const { dispatched } = moeTokens(cfg, par, train)
-      const bytes = dispatched * D * cB
+      const { dispatched, width } = moeTokens(cfg, par, train)
+      const bytes = dispatched * width * cB
       push({ axis: 'EP', phase: 'fwd', op: 'all-to-all', group: grp, what: 'token dispatch', bytes, count: nMoe })
       push({ axis: 'EP', phase: 'fwd', op: 'all-to-all', group: grp, what: 'token combine', bytes, count: nMoe })
       push({ axis: 'EP', phase: 'bwd', op: 'all-to-all', group: grp, what: 'grad of combine', bytes, count: nMoe })

@@ -6,7 +6,7 @@
 //     and every shard is held by the same number of ranks.
 //  3. Summed parameter bytes over the world == global bytes × replication.
 
-import { PRESETS } from '../src/lib/presets.js'
+import { PRESETS, fullModelStats } from '../src/lib/presets.js'
 import { buildModel, validateModel } from '../src/lib/model.js'
 import { rankCoords, validateParallel, worldSize, DEFAULT_PARALLEL } from '../src/lib/mesh.js'
 import { placeParam, shardLevels, tpApplies } from '../src/lib/shard.js'
@@ -39,6 +39,21 @@ const total = (params, filter = () => true) =>
   eq(total(ds, (p) => p.layer === 1 && p.group === 'attention'), 187_105_280, 'deepseek-v3 MLA attention params (excl. norms)')
   eq(total(ds, (p) => p.layer === 1 && p.group === 'experts'), 256 * 3 * 7168 * 2048, 'deepseek-v3 routed expert params')
   console.log('✓ reference parameter counts')
+}
+
+// ---- 1b. presets at full depth vs Hugging Face safetensors totals -----------
+{
+  let n = 0
+  for (const [key, preset] of Object.entries(PRESETS)) {
+    const st = fullModelStats(preset)
+    if (!st || !preset.published) continue
+    // Llama 4 checkpoints also carry the vision encoder, which is not modeled.
+    const tol = preset.publishedExtra === 'vision' ? 0.01 : 1e-4
+    const rel = Math.abs(st.total - preset.published) / preset.published
+    if (rel > tol) fail(`${key}: full-depth params ${st.total} vs published ${preset.published} (${(rel * 100).toFixed(3)}%)`)
+    n++
+  }
+  console.log(`✓ ${n} presets match published parameter totals at full depth`)
 }
 
 // ---- 2/3. tiling invariants -------------------------------------------------
