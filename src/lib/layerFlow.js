@@ -25,7 +25,10 @@ const cdiv = (a, b) => Math.ceil(a / b)
 const dm = (n, sym) => ({ n, sym })
 const lbl = (shape, name) => ({ name, shape })
 
-export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
+// `fullCfg` is the same model at its real depth: presets load truncated to a
+// couple of layers so the FQN table stays readable, and the repeat count has to
+// describe the model itself, not the stub.
+export function buildLayerFlow(cfg, par, train, prec, params, li, coords, fullCfg = cfg) {
   const b = train.micro_batch
   const S = train.seq_len
   const D = cfg.dim
@@ -171,6 +174,37 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     node({ id, kind: 'comm', col: 2, title: `${what} · ${par.dpStrategy.toUpperCase()}`, sub: 'parameter / gradient collectives', fwd, bwd })
   }
 
+  // Blocks repeat, but not always identically: the dense prefix of an MoE model,
+  // hash layers and the DSv4 compression schedule all vary with the index. Count
+  // only the blocks that would draw exactly like this one.
+  const layerKey = (c, i) => {
+    const mx = layerMixer(c, i)
+    // compress_ratios only shapes the graph on a DSv4 mixer; elsewhere it is inert
+    return [isMoeLayer(c, i), mx, isHashLayer(c, i), mx === 'dsv4' ? compressRatio(c, i) : 0, hasIndexer(c, i)].join('|')
+  }
+  const key = layerKey(cfg, li)
+  const scan = (c) => {
+    const hits = []
+    for (let i = 0; i < c.n_layers; i++) if (layerKey(c, i) === key) hits.push(i)
+    return hits
+  }
+  // Count in the full model, falling back to what is loaded if this kind of
+  // block has no counterpart there (a hand-edited config can do that).
+  let same = scan(fullCfg)
+  let of = fullCfg.n_layers
+  if (!same.length) {
+    same = scan(cfg)
+    of = cfg.n_layers
+  }
+  const repeat = {
+    count: same.length,
+    first: same[0],
+    last: same[same.length - 1],
+    contiguous: same[same.length - 1] - same[0] + 1 === same.length,
+    of,
+    truncated: of !== cfg.n_layers,
+  }
+
   // ---- Embedding --------------------------------------------------------------
   nextRow()
   // int64 ids: the embedding lookup has no input grad, so backward stops here
@@ -204,7 +238,7 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
   // ---- Block input ------------------------------------------------------------
   const blockFrom = nodes.length
   nextRow()
-  node({ id: 'in', kind: 'io', title: `${Li} input`, sub: `block i of ${cfg.n_layers}` })
+  node({ id: 'in', kind: 'io', title: `${Li} input`, sub: `block i of ${repeat.of}` })
   edge(embOut, 'in', [lbl(stream(sym.sSp))])
   if (top.fwd.length || top.bwd.length) {
     node({ id: 'dp_top', kind: 'comm', col: 2, title: `${Li} params · ${par.dpStrategy.toUpperCase()}`, sub: 'parameter / gradient collectives', ...top })
@@ -772,5 +806,7 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
       }
     }
   }
-  return { nodes, edges, moe, totals, layerParams }
+  // Node ids inside the repeated block, for the shaded region in LayerView.
+  const block = { ids: nodes.slice(blockFrom, blockTo).map((n) => n.id), repeat }
+  return { nodes, edges, moe, totals, layerParams, block }
 }

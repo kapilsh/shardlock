@@ -869,6 +869,35 @@
   overflow: visible;
 }
 
+.lf-band {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px dashed var(--border-strong);
+  border-radius: 14px;
+  background: rgba(118, 185, 0, 0.035);
+  pointer-events: none;
+}
+.lf-band-tag {
+  position: absolute;
+  top: -10px;
+  left: 16px;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--bg-card);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.lf-band-note {
+  font-weight: 400;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
 .lf-edge {
   fill: none;
   stroke: #4a5c40;

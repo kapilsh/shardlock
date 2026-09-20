@@ -8,7 +8,8 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "validate": "node scripts/validate.mjs"
+    "validate": "node scripts/validate.mjs",
+    "check:hf": "node scripts/check-hf.mjs"
   },
   "dependencies": {
     "react": "^19.2.0",

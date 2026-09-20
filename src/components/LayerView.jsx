@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useStore } from '../store/store.js'
+import { PRESETS } from '../lib/presets.js'
 import { buildLayerFlow } from '../lib/layerFlow.js'
 import { isMoeLayer } from '../lib/model.js'
 import { DTYPE_BYTES, formatBytes, formatCount, formatShape, prod } from '../lib/format.js'
@@ -16,6 +17,7 @@ const GAP = 46
 const PAD = 16
 const LH = 13
 const RAIL_R = 28 // right-hand rail for long skip edges
+const BAND_PAD = 18 // breathing room around the repeated-block region
 
 function nodeHeight(n) {
   switch (n.kind) {
@@ -54,7 +56,19 @@ function layout(graph) {
   const lanes = Math.max(3, Math.ceil(Math.max(...graph.nodes.map((n) => n.col)) + 1))
   const rail = graph.edges.some((e) => e.route === 'rail')
   const railX = RAIL + lanes * LANE + RAIL_R / 2
-  return { pos, width: RAIL + lanes * LANE + (rail ? RAIL_R : PAD), height: y - GAP + PAD, railX }
+  const width = RAIL + lanes * LANE + (rail ? RAIL_R : PAD)
+  // Band behind the repeated block: full width, so it also covers the residual
+  // rail on the left and the parameter-collective lane on the right.
+  const inBlock = graph.block.ids.map((id) => pos.get(id)).filter(Boolean)
+  const band = inBlock.length
+    ? {
+        x: 2,
+        width: width - 4,
+        y: Math.min(...inBlock.map((p) => p.rowTop)) - BAND_PAD,
+        height: Math.max(...inBlock.map((p) => p.rowBottom)) - Math.min(...inBlock.map((p) => p.rowTop)) + 2 * BAND_PAD,
+      }
+    : null
+  return { pos, width, height: y - GAP + PAD, railX, band }
 }
 
 const labelText = (l, mode) => `${l.name ? `${l.name} ` : ''}${fmtShape(l.shape, mode)}`
@@ -148,6 +162,15 @@ function edgeGeometry(graph, pos, width, mode, railX) {
   })
 }
 
+// "x 60" needs saying which 60: the dense prefix of an MoE model is not this
+// block, and a hybrid model interleaves two kinds of block through the stack.
+const repeatNote = (r) => {
+  if (r.count === 1) return `layers.${r.first} only`
+  if (r.count === r.of) return 'identical blocks'
+  if (r.contiguous) return `identical blocks · layers.${r.first}–${r.last}`
+  return `identical blocks · ${r.count} of ${r.of}, interleaved`
+}
+
 const fmtShape = (shape, mode) =>
   `[${shape.map((x) => (mode === 'symbols' ? x.sym : x.n.toLocaleString('en-US'))).join(', ')}]`
 const compactShape = (shape) => `[${shape.join(', ')}]`
@@ -168,10 +191,24 @@ export default function LayerView({ params, coords }) {
   const [animate, setAnimate] = useState(true)
   const [selId, setSelId] = useState(null)
 
+  // Presets are loaded truncated to a couple of layers; the repeat count in the
+  // diagram should still describe the real model. Editing the model clears
+  // presetKey to 'custom', so this only fires on an unmodified preset.
+  const presetKey = useStore((s) => s.presetKey)
+  const fullModel = useMemo(() => {
+    const full = PRESETS[presetKey]?.full
+    if (!full) return model
+    const { mtp_layers: _a, mtp_embed_copies: _b, mtp_full_attn: _c, ...over } = full
+    return { ...model, ...over }
+  }, [presetKey, model])
+
   const defaultLayer = model.arch === 'moe' ? Math.min(model.n_dense_layers, model.n_layers - 1) : 0
   const li = Math.min(layerSel ?? defaultLayer, model.n_layers - 1)
 
-  const graph = useMemo(() => buildLayerFlow(model, par, train, prec, params, li, coords), [model, par, train, prec, params, li, coords])
+  const graph = useMemo(
+    () => buildLayerFlow(model, par, train, prec, params, li, coords, fullModel),
+    [model, par, train, prec, params, li, coords, fullModel],
+  )
   const geo = useMemo(() => {
     const lay = layout(graph)
     return { ...lay, edges: edgeGeometry(graph, lay.pos, lay.width, labelMode, lay.railX) }
@@ -236,7 +273,11 @@ export default function LayerView({ params, coords }) {
                   ? 'Gradients flow bottom → top. Edges carry ∂ of the activation; param nodes show ∂W on this rank; collectives are the backward conjugates.'
                   : 'Activations flow top → bottom. Edges show local tensor shapes on this rank; collectives appear where they fire.'}{' '}
                 The block is drawn as a generic <code>layers[i]</code>, with the embedding above it and the model head
-                below it. Click a node for details.
+                below it.{' '}
+                {graph.block.repeat.truncated
+                  ? `The repeat count is for the full ${fullModel.n_layers}-layer model; the preset loads ${model.n_layers} layers so the tables stay readable. `
+                  : ''}
+                Click a node for details.
               </p>
             </div>
             <div className="legend">
@@ -259,6 +300,14 @@ export default function LayerView({ params, coords }) {
           )}
           <div className="lf-scroll">
             <div className="lf-canvas" style={{ width: geo.width, height: geo.height }}>
+              {geo.band && (
+                <div className="lf-band" style={{ left: geo.band.x, top: geo.band.y, width: geo.band.width, height: geo.band.height }}>
+                  <span className="lf-band-tag">
+                    × {graph.block.repeat.count}
+                    <span className="lf-band-note">{repeatNote(graph.block.repeat)}</span>
+                  </span>
+                </div>
+              )}
               <svg width={geo.width} height={geo.height} aria-hidden="true">
                 <defs>
                   <marker id="lf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">

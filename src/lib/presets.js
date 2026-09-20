@@ -232,7 +232,7 @@ export const PRESETS = {
       vocab_size: 129280, dim: 7168, ffn_dim: 18432, moe_inter_dim: 2048, n_routed_experts: 256, n_activated_experts: 8, n_shared_experts: 1, n_dense_layers: 1, tie_embeddings: false,
     }),
     full: { n_layers: 61, n_dense_layers: 3, mtp_layers: 1, mtp_embed_copies: true },
-    published: 685_396_921_376,
+    published: 685_355_329_792,
   },
 
   'deepseek-v4-flash': {
@@ -269,6 +269,7 @@ export const PRESETS = {
     label: 'Kimi K3 2.8T',
     group: 'Moonshot',
     source: 'moonshotai/Kimi-K3',
+    publishedExcludes: 'vision encoder',
     note: '3 layers shown: KDA + dense MLP, KDA + latent MoE, gated MLA + latent MoE; text weights only (vision encoder excluded)',
     config: moe({
       ...dsMoe,
