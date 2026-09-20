@@ -121,6 +121,12 @@ for (const key of Object.keys(PRESETS)) {
           for (const p of params.filter((q) => q.layer === li && !(q.expert && q.expert.index != null))) {
             if (!shown.has(p.fqn)) fail(`${key}/${layout} layer ${li}: ${p.fqn} missing from layer flow`)
           }
+          // every layer is drawn between the embedding and the model head
+          for (const p of params.filter((q) => q.layer === null)) {
+            if (!shown.has(p.fqn)) fail(`${key}/${layout} layer ${li}: root param ${p.fqn} missing from layer flow`)
+          }
+          const lm = cfg.tie_embeddings ? 'tok_embeddings.weight' : 'lm_head.weight'
+          if (!shown.has(lm)) fail(`${key}/${layout} layer ${li}: ${lm} missing from layer flow head`)
         }
       }
       const wm = worldMemory(params, par, DEFAULT_PRECISION)

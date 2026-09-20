@@ -197,11 +197,11 @@ export default function LayerView({ params, coords }) {
     <div className="layer-view">
       <div className="lf-controls">
         <label className="field lf-layer">
-          <span className="field-label">Layer</span>
+          <span className="field-label">Which block (i)</span>
           <select value={li} onChange={(e) => { setLayerSel(Number(e.target.value)); setSelId(null) }}>
             {Array.from({ length: model.n_layers }, (_, i) => (
               <option key={i} value={i}>
-                layers.{i} · {isMoeLayer(model, i) ? 'MoE' : 'dense'}
+                i = {i} · {isMoeLayer(model, i) ? 'MoE' : 'dense'}
               </option>
             ))}
           </select>
@@ -220,8 +220,8 @@ export default function LayerView({ params, coords }) {
       <div className="stat-row">
         <Stat label={`layers.${li} params`} value={formatCount(stats.g)} sub={graph.moe ? 'MoE block' : 'dense block'} />
         <Stat label={`On rank ${coords.rank}`} value={formatCount(stats.l)} sub={`${formatBytes(stats.l * DTYPE_BYTES[prec.weight])} weights (${prec.weight})`} />
-        <Stat label={`Forward comm · ${graph.totals.fwdCalls} calls`} value={formatBytes(graph.totals.fwd)} />
-        <Stat label={`Backward comm · ${graph.totals.bwdCalls} calls`} value={formatBytes(graph.totals.bwd)} />
+        <Stat label={`Forward comm · ${graph.totals.fwdCalls} calls`} value={formatBytes(graph.totals.fwd)} sub="this block only" />
+        <Stat label={`Backward comm · ${graph.totals.bwdCalls} calls`} value={formatBytes(graph.totals.bwd)} sub="this block only" />
       </div>
 
       <div className="lf-wrap">
@@ -235,7 +235,8 @@ export default function LayerView({ params, coords }) {
                 {bwd
                   ? 'Gradients flow bottom → top. Edges carry ∂ of the activation; param nodes show ∂W on this rank; collectives are the backward conjugates.'
                   : 'Activations flow top → bottom. Edges show local tensor shapes on this rank; collectives appear where they fire.'}{' '}
-                Click a node for details.
+                The block is drawn as a generic <code>layers[i]</code>, with the embedding above it and the model head
+                below it. Click a node for details.
               </p>
             </div>
             <div className="legend">
@@ -265,11 +266,13 @@ export default function LayerView({ params, coords }) {
                   </marker>
                 </defs>
                 {geo.edges.map((e, i) => {
-                  const markers = bwd ? { markerStart: 'url(#lf-arrow)' } : { markerEnd: 'url(#lf-arrow)' }
+                  // nothing flows back along an integer edge: draw it dead, no arrow
+                  const dead = bwd && e.noGrad
+                  const markers = dead ? {} : bwd ? { markerStart: 'url(#lf-arrow)' } : { markerEnd: 'url(#lf-arrow)' }
                   return (
                     <g key={i}>
-                      <path d={e.d} className={`lf-edge ${e.kind === 'residual' ? 'residual' : ''} ${bwd ? 'grad' : 'act'}`} {...markers} />
-                      {animate && <path d={e.d} className={`lf-flow ${bwd ? 'grad rev' : 'act'}`} />}
+                      <path d={e.d} className={`lf-edge ${e.kind === 'residual' ? 'residual' : ''} ${bwd ? 'grad' : 'act'} ${dead ? 'nograd' : ''}`} {...markers} />
+                      {animate && !dead && <path d={e.d} className={`lf-flow ${bwd ? 'grad rev' : 'act'}`} />}
                     </g>
                   )
                 })}
@@ -282,9 +285,9 @@ export default function LayerView({ params, coords }) {
                     <text key={`l${i}`} className="lf-label" x={e.label.x} y={e.label.y} textAnchor={e.label.anchor}>
                       {e.labels.map((l, j) => (
                         <tspan key={j} x={e.label.x} dy={j ? LH : 0}>
-                          {bwd ? '∂' : ''}
-                          {l.name ? `${l.name} ` : bwd ? ' ' : ''}
-                          {fmtShape(l.shape, labelMode)}
+                          {bwd && e.noGrad
+                            ? `${l.name ? `${l.name} · ` : ''}no grad`
+                            : `${bwd ? '∂' : ''}${l.name ? `${l.name} ` : bwd ? ' ' : ''}${fmtShape(l.shape, labelMode)}`}
                         </tspan>
                       ))}
                     </text>
@@ -334,10 +337,11 @@ function NodeBox({ n, box, dir, sel, onSelect, byFqn, par, coords, prec }) {
   const selCls = sel ? 'sel' : ''
 
   if (n.kind === 'io') {
+    const dead = dir === 'bwd' && n.noGrad
     return (
-      <div className={`lf-node lf-io ${selCls}`} style={style} {...interactive}>
+      <div className={`lf-node lf-io ${selCls} ${dead ? 'dimmed' : ''}`} style={style} {...interactive}>
         <div className="lf-title mono">{n.title}</div>
-        <div className="lf-sub">{n.sub}</div>
+        <div className="lf-sub">{dead ? 'no gradient · backward stops here' : n.sub}</div>
       </div>
     )
   }

@@ -880,6 +880,10 @@
 .lf-edge.residual {
   stroke-width: 1.5;
 }
+.lf-edge.nograd {
+  stroke-dasharray: 3 5;
+  opacity: 0.45;
+}
 .lf-arrow.act {
   fill: #b5d67a;
 }
@@ -971,6 +975,10 @@
   border-color: var(--nv-green-dim);
   background: rgba(118, 185, 0, 0.08);
   text-align: center;
+}
+.lf-io.dimmed {
+  opacity: 0.55;
+  border-style: dashed;
 }
 .lf-fork {
   padding: 0;

@@ -7,6 +7,14 @@
 // Nodes sit on a 3-lane grid (col 0 / 1 / 2, fractional allowed); `row` is the
 // vertical order. Edges with route 'rail' run along a rail right of the grid
 // (long skips from the attention input). Layout and drawing live in LayerView.jsx.
+//
+// The block is drawn as a generic `layers[i]`: parameter FQNs stay concrete
+// (they name real tensors on this rank) but the structural labels do not, so the
+// picture reads as any layer of the model. The ends of the model are always
+// drawn around it -- input ids through tok_embeddings above, final_norm and the
+// output projection below -- each with its own FSDP/HSDP unit, so one picture
+// covers the whole forward path. Only the block's own collectives are summed
+// into `totals`; the embedding and the head fire once per step, not per layer.
 
 import { DTYPE_BYTES, prod } from './format.js'
 import { compressRatio, hasIndexer, isHashLayer, isMoeLayer, layerMixer } from './model.js'
@@ -27,6 +35,9 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
   const cB = DTYPE_BYTES[prec.compute]
   const gB = DTYPE_BYTES[prec.grad]
   const L = `layers.${li}`
+  const Li = 'layers[i]'
+  // lm_head / tok_embeddings are only vocab-sharded when vocab parallelism is on
+  const vp = tpOn && par.vocabParallel
   const moe = isMoeLayer(cfg, li)
   const mixer = layerMixer(cfg, li)
   const dsv4 = cfg.attn_type === 'dsv4'
@@ -102,54 +113,101 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     return id
   }
 
-  // ---- Data-parallel param / grad collectives for this layer's FSDP unit ----
-  const layerParams = params.filter((p) => p.layer === li)
-  const trainable = layerParams.filter((p) => p.kind === 'param')
+  // ---- Data-parallel param / grad collectives for one FSDP unit ---------------
   const sum = (ps, f) => ps.reduce((a, p) => a + f(p), 0)
   const full = (ps) => sum(ps, (p) => unshardedLocalNumel(p, par, coords))
   const local = (ps) => sum(ps, (p) => placeParam(p, par, coords).localNumel)
-  const denseP = trainable.filter((p) => !p.expert)
-  const expertP = trainable.filter((p) => p.expert)
-  const top = { fwd: [], bwd: [] }
-  const bottom = { fwd: [], bwd: [] }
   const edpDeg = par.dp / par.ep
 
-  if (par.dpStrategy === 'ddp') {
-    if (par.dp > 1 && denseP.length) {
-      top.bwd.push({ axis: 'DP', op: 'all-reduce', group: `DP·${par.dp}`, groupKey: 'dp', bytes: full(denseP) * gB, note: 'average grads across replicas as soon as they are ready (bucketed with neighbouring layers)' })
-    }
-    if (expertP.length && edpDeg > 1) {
-      top.bwd.push({ axis: 'DP', op: 'all-reduce', group: `EDP·${edpDeg}`, groupKey: 'edp', bytes: full(expertP) * gB, note: 'average expert grads across expert-data-parallel replicas' })
-    }
-  } else {
-    const hsdp = par.dpStrategy === 'hsdp'
-    const axis = hsdp ? 'HSDP' : 'FSDP'
-    const parts = [
-      { ps: denseP, deg: hsdp ? par.hsdpShard : par.dp, what: 'params', key: 'shard' },
-      { ps: expertP, deg: hsdp ? par.hsdpShard / par.ep : edpDeg, what: 'expert params', key: hsdp ? null : 'edp' },
-    ]
-    for (const part of parts) {
-      if (!part.ps.length || part.deg <= 1) continue
-      const group = `${axis}·${part.deg}`
-      const e = { axis, group, groupKey: part.key }
-      top.fwd.push({ ...e, op: 'all-gather', bytes: full(part.ps) * cB, note: `unshard ${L} ${part.what} (${prec.compute}) right before this layer’s forward` })
-      top.bwd.push({ ...e, op: 'reduce-scatter', bytes: full(part.ps) * gB, note: `average ${part.what} grads across the shard group and keep only this rank’s shard` })
-      if (par.reshardAfterForward) {
-        bottom.fwd.push({ ...e, op: 'reshard', idle: true, bytes: 0, note: 'free the gathered params once forward leaves the layer' })
-        bottom.bwd.push({ ...e, op: 'all-gather', bytes: full(part.ps) * cB, note: `re-unshard ${part.what} before this layer’s backward` })
+  const dpCollectives = (unitParams, unit) => {
+    const trainable = unitParams.filter((p) => p.kind === 'param')
+    const denseP = trainable.filter((p) => !p.expert)
+    const expertP = trainable.filter((p) => p.expert)
+    const top = { fwd: [], bwd: [] }
+    const bottom = { fwd: [], bwd: [] }
+
+    if (par.dpStrategy === 'ddp') {
+      if (par.dp > 1 && denseP.length) {
+        top.bwd.push({ axis: 'DP', op: 'all-reduce', group: `DP·${par.dp}`, groupKey: 'dp', bytes: full(denseP) * gB, note: 'average grads across replicas as soon as they are ready (bucketed with neighbouring layers)' })
+      }
+      if (expertP.length && edpDeg > 1) {
+        top.bwd.push({ axis: 'DP', op: 'all-reduce', group: `EDP·${edpDeg}`, groupKey: 'edp', bytes: full(expertP) * gB, note: 'average expert grads across expert-data-parallel replicas' })
+      }
+    } else {
+      const hsdp = par.dpStrategy === 'hsdp'
+      const axis = hsdp ? 'HSDP' : 'FSDP'
+      const parts = [
+        { ps: denseP, deg: hsdp ? par.hsdpShard : par.dp, what: 'params', key: 'shard' },
+        { ps: expertP, deg: hsdp ? par.hsdpShard / par.ep : edpDeg, what: 'expert params', key: hsdp ? null : 'edp' },
+      ]
+      for (const part of parts) {
+        if (!part.ps.length || part.deg <= 1) continue
+        const group = `${axis}·${part.deg}`
+        const e = { axis, group, groupKey: part.key }
+        top.fwd.push({ ...e, op: 'all-gather', bytes: full(part.ps) * cB, note: `unshard ${unit} ${part.what} (${prec.compute}) just before its forward` })
+        top.bwd.push({ ...e, op: 'reduce-scatter', bytes: full(part.ps) * gB, note: `average ${part.what} grads across the shard group and keep only this rank’s shard` })
+        if (par.reshardAfterForward) {
+          bottom.fwd.push({ ...e, op: 'reshard', idle: true, bytes: 0, note: `free the gathered params once forward leaves ${unit}` })
+          bottom.bwd.push({ ...e, op: 'all-gather', bytes: full(part.ps) * cB, note: `re-unshard ${part.what} before ${unit}’s backward` })
+        }
+      }
+      if (hsdp && par.dp / par.hsdpShard > 1) {
+        const rep = par.dp / par.hsdpShard
+        top.bwd.push({ axis, op: 'all-reduce', group: `replica·${rep}`, groupKey: null, bytes: local(trainable) * gB, note: 'average the sharded grads across HSDP replica blocks' })
       }
     }
-    if (hsdp && par.dp / par.hsdpShard > 1) {
-      const rep = par.dp / par.hsdpShard
-      top.bwd.push({ axis, op: 'all-reduce', group: `replica·${rep}`, groupKey: null, bytes: local(trainable) * gB, note: 'average the sharded grads across HSDP replica blocks' })
-    }
+    return { top, bottom }
+  }
+
+  const layerParams = params.filter((p) => p.layer === li)
+  const { top, bottom } = dpCollectives(layerParams, Li)
+
+  // A unit's gathers and reshards fold into one node: all-gather then reshard on
+  // the way forward, re-gather then reduce-scatter on the way back.
+  const dpNode = (id, dp, what) => {
+    const fwd = [...dp.top.fwd, ...dp.bottom.fwd]
+    const bwd = [...dp.bottom.bwd, ...dp.top.bwd]
+    if (!fwd.length && !bwd.length) return
+    node({ id, kind: 'comm', col: 2, title: `${what} · ${par.dpStrategy.toUpperCase()}`, sub: 'parameter / gradient collectives', fwd, bwd })
+  }
+
+  // ---- Embedding --------------------------------------------------------------
+  nextRow()
+  // int64 ids: the embedding lookup has no input grad, so backward stops here
+  node({ id: 'tokens', kind: 'io', noGrad: true, title: 'input ids', sub: 'tokenized text · int64' })
+  nextRow()
+  node({
+    id: 'tok_emb',
+    kind: 'module',
+    title: 'tok_embeddings',
+    sub: vp ? 'vocab-parallel lookup' : 'embedding lookup',
+    params: pick('tok_embeddings.weight'),
+  })
+  edge('tokens', 'tok_emb', [lbl([sym.b, sym.sCp], 'ids')], { noGrad: true })
+  dpNode('dp_emb', dpCollectives(params.filter((p) => p.layer === null && p.group === 'embedding'), 'tok_embeddings'), 'embedding params')
+  let embOut = 'tok_emb'
+  if (vp) {
+    // Each rank owns a vocab slice and zeroes the rows it does not hold, so the
+    // partial lookups have to be summed (Megatron g, or reduce-scatter under SP).
+    nextRow()
+    tpExit('tp_emb_out', 'embedding')
+    edge('tok_emb', 'tp_emb_out', [lbl(hidden(sym.sCp), 'partial h')])
+    embOut = 'tp_emb_out'
+  }
+  if (dsv4) {
+    nextRow()
+    node({ id: 'hc_expand', kind: 'op', title: 'expand residual', sub: `1 → ${hcM} residual copies` })
+    edge(embOut, 'hc_expand', [lbl(hidden(sym.sSp))])
+    embOut = 'hc_expand'
   }
 
   // ---- Block input ------------------------------------------------------------
+  const blockFrom = nodes.length
   nextRow()
-  node({ id: 'in', kind: 'io', title: `${L} input`, sub: li === 0 ? 'from tok_embeddings' : `from layers.${li - 1}` })
+  node({ id: 'in', kind: 'io', title: `${Li} input`, sub: `block i of ${cfg.n_layers}` })
+  edge(embOut, 'in', [lbl(stream(sym.sSp))])
   if (top.fwd.length || top.bwd.length) {
-    node({ id: 'dp_top', kind: 'comm', col: 2, title: `${L} params · ${par.dpStrategy.toUpperCase()}`, sub: 'parameter / gradient collectives', ...top })
+    node({ id: 'dp_top', kind: 'comm', col: 2, title: `${Li} params · ${par.dpStrategy.toUpperCase()}`, sub: 'parameter / gradient collectives', ...top })
   }
 
   // ---- Attention --------------------------------------------------------------
@@ -582,7 +640,7 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
     } else {
       edge(mIn, 'dispatch')
     }
-    edge('topk', 'dispatch', [lbl([Td, K], 'indices')])
+    edge('topk', 'dispatch', [lbl([Td, K], 'indices')], { noGrad: true })
 
     nextRow()
     let expertFqns
@@ -653,14 +711,59 @@ export function buildLayerFlow(cfg, par, train, prec, params, li, coords) {
   closeSublayer('add2', 'res2', ffnOut, [lbl(ffnOutShape)])
 
   nextRow()
-  node({ id: 'out', kind: 'io', title: `${L} output`, sub: li + 1 < cfg.n_layers ? `to layers.${li + 1}` : 'to final_norm' })
+  node({ id: 'out', kind: 'io', title: `${Li} output`, sub: 'to layers[i+1], or the head' })
   if (bottom.fwd.length || bottom.bwd.length) {
-    node({ id: 'dp_bottom', kind: 'comm', col: 2, title: `${L} params · ${par.dpStrategy.toUpperCase()}`, sub: 'parameter collectives', ...bottom })
+    node({ id: 'dp_bottom', kind: 'comm', col: 2, title: `${Li} params · ${par.dpStrategy.toUpperCase()}`, sub: 'parameter collectives', ...bottom })
   }
   edge('add2', 'out', [lbl(stream(sym.sSp))])
+  const blockTo = nodes.length
 
+  // ---- Model head -------------------------------------------------------------
+  {
+    let src = 'out'
+    let shape = stream(sym.sSp)
+    const step = (id, n, labels = [lbl(shape)]) => {
+      nextRow()
+      node({ id, ...n })
+      edge(src, id, labels)
+      src = id
+    }
+    if (dsv4) {
+      step('hc_head', { kind: 'module', title: 'hc_head', sub: `Sinkhorn mix: ${hcM} residual copies → 1`, params: pick('hc_head.fn', 'hc_head.base', 'hc_head.scale') })
+      shape = hidden(sym.sSp)
+    }
+    if (cfg.attn_res) {
+      step('out_res', { kind: 'module', title: 'output residual', sub: 'softmax-weighted mix of earlier layer outputs', params: pick('output_res_norm.weight', 'output_res_proj.weight') })
+    }
+    step('final_norm', { kind: 'module', title: 'final_norm', sub: 'RMSNorm', params: pick('final_norm.weight') })
+    dpNode('dp_head', dpCollectives(params.filter((p) => p.layer === null && p.group !== 'embedding'), 'the head'), 'head params')
+
+    // lm_head is vocab-parallel only when asked for; otherwise it is replicated
+    // and each rank keeps the logits for its own sequence shard (no collective).
+    let seq = sym.sSp
+    if (vp) {
+      nextRow()
+      tpEnter('tp_head_in', 'lm_head')
+      edge(src, 'tp_head_in', [lbl(hidden(sym.sSp))])
+      src = 'tp_head_in'
+      seq = sym.sCp
+    }
+    shape = hidden(seq)
+    const tied = cfg.tie_embeddings
+    step('lm_head', {
+      kind: 'module',
+      title: 'lm_head',
+      sub: `${vp ? 'vocab-parallel' : 'd → vocab'}${tied ? ' · tied embeddings' : ''}`,
+      params: pick(tied ? 'tok_embeddings.weight' : 'lm_head.weight'),
+    })
+    const V = dm(vp ? cdiv(cfg.vocab_size, tp) : cfg.vocab_size, vp ? 'V/tp' : 'V')
+    step('logits', { kind: 'io', title: 'logits', sub: vp ? 'vocab-parallel → loss parallel' : 'to cross-entropy loss' }, [lbl([sym.b, seq, V])])
+  }
+
+  // Only the block itself: the embedding and the head fire once per step, so
+  // folding them in would make the per-layer numbers wrong.
   const totals = { fwd: 0, bwd: 0, fwdCalls: 0, bwdCalls: 0 }
-  for (const n of nodes) {
+  for (const n of nodes.slice(blockFrom, blockTo)) {
     for (const dir of ['fwd', 'bwd']) {
       for (const e of n[dir]) {
         if (e.idle) continue
