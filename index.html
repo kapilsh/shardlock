@@ -9,6 +9,17 @@
     <meta http-equiv="Pragma" content="no-cache" />
     <meta http-equiv="Expires" content="0" />
     <title>Shardlock — where did my tensors go?</title>
+    <!-- Google Analytics (GA4). Same measurement ID as the blog: these apps are
+         separate repos, but they publish to paths under the same origin
+         (www.kapilsharma.dev/<app>/), so one property/data stream covers both
+         and sessions carry across without cross-domain measurement. -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-PXLMMX5QRS"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() { dataLayer.push(arguments); }
+      gtag('js', new Date());
+      gtag('config', 'G-PXLMMX5QRS');
+    </script>
   </head>
   <body>
     <div id="root"></div>
